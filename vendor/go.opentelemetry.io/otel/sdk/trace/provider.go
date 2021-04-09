@@ -12,192 +12,316 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package trace
+package trace // import "go.opentelemetry.io/otel/sdk/trace"
 
 import (
+	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
-	export "go.opentelemetry.io/otel/sdk/export/trace"
-	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 
-	apitrace "go.opentelemetry.io/otel/api/trace"
+	export "go.opentelemetry.io/otel/sdk/export/trace"
+	"go.opentelemetry.io/otel/sdk/instrumentation"
+	"go.opentelemetry.io/otel/sdk/resource"
 )
 
 const (
 	defaultTracerName = "go.opentelemetry.io/otel/sdk/tracer"
 )
 
-// batcher contains export.SpanBatcher and its options.
-type batcher struct {
-	b    export.SpanBatcher
-	opts []BatchSpanProcessorOption
+// TODO (MrAlias): unify this API option design:
+// https://github.com/open-telemetry/opentelemetry-go/issues/536
+
+// TracerProviderConfig
+type TracerProviderConfig struct {
+	processors []SpanProcessor
+
+	// sampler is the default sampler used when creating new spans.
+	sampler Sampler
+
+	// idGenerator is used to generate all Span and Trace IDs when needed.
+	idGenerator IDGenerator
+
+	// spanLimits defines the attribute, event, and link limits for spans.
+	spanLimits SpanLimits
+
+	// resource contains attributes representing an entity that produces telemetry.
+	resource *resource.Resource
 }
 
-// ProviderOptions
-type ProviderOptions struct {
-	syncers  []export.SpanSyncer
-	batchers []batcher
-	config   Config
-}
+type TracerProviderOption func(*TracerProviderConfig)
 
-type ProviderOption func(*ProviderOptions)
-
-type Provider struct {
+type TracerProvider struct {
 	mu             sync.Mutex
-	namedTracer    map[string]*tracer
+	namedTracer    map[instrumentation.Library]*tracer
 	spanProcessors atomic.Value
-	config         atomic.Value // access atomically
+	sampler        Sampler
+	idGenerator    IDGenerator
+	spanLimits     SpanLimits
+	resource       *resource.Resource
 }
 
-var _ apitrace.Provider = &Provider{}
+var _ trace.TracerProvider = &TracerProvider{}
 
-// NewProvider creates an instance of trace provider. Optional
-// parameter configures the provider with common options applicable
-// to all tracer instances that will be created by this provider.
-func NewProvider(opts ...ProviderOption) (*Provider, error) {
-	o := &ProviderOptions{}
+// NewTracerProvider returns a new and configured TracerProvider.
+//
+// By default the returned TracerProvider is configured with:
+//  - a ParentBased(AlwaysSample) Sampler
+//  - a random number IDGenerator
+//  - the resource.Default() Resource
+//  - the default SpanLimits.
+//
+// The passed opts are used to override these default values and configure the
+// returned TracerProvider appropriately.
+func NewTracerProvider(opts ...TracerProviderOption) *TracerProvider {
+	o := &TracerProviderConfig{}
 
 	for _, opt := range opts {
 		opt(o)
 	}
 
-	tp := &Provider{
-		namedTracer: make(map[string]*tracer),
-	}
-	tp.config.Store(&Config{
-		DefaultSampler:       AlwaysSample(),
-		IDGenerator:          defIDGenerator(),
-		MaxAttributesPerSpan: DefaultMaxAttributesPerSpan,
-		MaxEventsPerSpan:     DefaultMaxEventsPerSpan,
-		MaxLinksPerSpan:      DefaultMaxLinksPerSpan,
-	})
+	ensureValidTracerProviderConfig(o)
 
-	for _, syncer := range o.syncers {
-		ssp := NewSimpleSpanProcessor(syncer)
-		tp.RegisterSpanProcessor(ssp)
+	tp := &TracerProvider{
+		namedTracer: make(map[instrumentation.Library]*tracer),
+		sampler:     o.sampler,
+		idGenerator: o.idGenerator,
+		spanLimits:  o.spanLimits,
+		resource:    o.resource,
 	}
 
-	for _, batcher := range o.batchers {
-		bsp, err := NewBatchSpanProcessor(batcher.b, batcher.opts...)
-		if err != nil {
-			return nil, err
-		}
-		tp.RegisterSpanProcessor(bsp)
+	for _, sp := range o.processors {
+		tp.RegisterSpanProcessor(sp)
 	}
 
-	tp.ApplyConfig(o.config)
-
-	return tp, nil
+	return tp
 }
 
-// Tracer with the given name. If a tracer for the given name does not exist,
-// it is created first. If the name is empty, DefaultTracerName is used.
-func (p *Provider) Tracer(name string) apitrace.Tracer {
+// Tracer returns a Tracer with the given name and options. If a Tracer for
+// the given name and options does not exist it is created, otherwise the
+// existing Tracer is returned.
+//
+// If name is empty, DefaultTracerName is used instead.
+//
+// This method is safe to be called concurrently.
+func (p *TracerProvider) Tracer(name string, opts ...trace.TracerOption) trace.Tracer {
+	c := trace.NewTracerConfig(opts...)
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if name == "" {
 		name = defaultTracerName
 	}
-	t, ok := p.namedTracer[name]
+	il := instrumentation.Library{
+		Name:    name,
+		Version: c.InstrumentationVersion,
+	}
+	t, ok := p.namedTracer[il]
 	if !ok {
-		t = &tracer{name: name, provider: p}
-		p.namedTracer[name] = t
+		t = &tracer{
+			provider:               p,
+			instrumentationLibrary: il,
+		}
+		p.namedTracer[il] = t
 	}
 	return t
 }
 
 // RegisterSpanProcessor adds the given SpanProcessor to the list of SpanProcessors
-func (p *Provider) RegisterSpanProcessor(s SpanProcessor) {
+func (p *TracerProvider) RegisterSpanProcessor(s SpanProcessor) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	new := make(spanProcessorMap)
-	if old, ok := p.spanProcessors.Load().(spanProcessorMap); ok {
-		for k, v := range old {
-			new[k] = v
-		}
+	new := spanProcessorStates{}
+	if old, ok := p.spanProcessors.Load().(spanProcessorStates); ok {
+		new = append(new, old...)
 	}
-	new[s] = &sync.Once{}
+	newSpanSync := &spanProcessorState{
+		sp:    s,
+		state: &sync.Once{},
+	}
+	new = append(new, newSpanSync)
 	p.spanProcessors.Store(new)
 }
 
 // UnregisterSpanProcessor removes the given SpanProcessor from the list of SpanProcessors
-func (p *Provider) UnregisterSpanProcessor(s SpanProcessor) {
-	mu.Lock()
-	defer mu.Unlock()
-	new := make(spanProcessorMap)
-	if old, ok := p.spanProcessors.Load().(spanProcessorMap); ok {
-		for k, v := range old {
-			new[k] = v
-		}
-	}
-	if stopOnce, ok := new[s]; ok && stopOnce != nil {
-		stopOnce.Do(func() {
-			s.Shutdown()
-		})
-	}
-	delete(new, s)
-	p.spanProcessors.Store(new)
-}
-
-// ApplyConfig changes the configuration of the provider.
-// If a field in the configuration is empty or nil then its original value is preserved.
-func (p *Provider) ApplyConfig(cfg Config) {
+func (p *TracerProvider) UnregisterSpanProcessor(s SpanProcessor) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	c := *p.config.Load().(*Config)
-	if cfg.DefaultSampler != nil {
-		c.DefaultSampler = cfg.DefaultSampler
+	spss := spanProcessorStates{}
+	old, ok := p.spanProcessors.Load().(spanProcessorStates)
+	if !ok || len(old) == 0 {
+		return
 	}
-	if cfg.IDGenerator != nil {
-		c.IDGenerator = cfg.IDGenerator
+	spss = append(spss, old...)
+
+	// stop the span processor if it is started and remove it from the list
+	var stopOnce *spanProcessorState
+	var idx int
+	for i, sps := range spss {
+		if sps.sp == s {
+			stopOnce = sps
+			idx = i
+		}
 	}
-	if cfg.MaxEventsPerSpan > 0 {
-		c.MaxEventsPerSpan = cfg.MaxEventsPerSpan
+	if stopOnce != nil {
+		stopOnce.state.Do(func() {
+			if err := s.Shutdown(context.Background()); err != nil {
+				otel.Handle(err)
+			}
+		})
 	}
-	if cfg.MaxAttributesPerSpan > 0 {
-		c.MaxAttributesPerSpan = cfg.MaxAttributesPerSpan
+	if len(spss) > 1 {
+		copy(spss[idx:], spss[idx+1:])
 	}
-	if cfg.MaxLinksPerSpan > 0 {
-		c.MaxLinksPerSpan = cfg.MaxLinksPerSpan
-	}
-	if cfg.Resource != nil {
-		c.Resource = cfg.Resource
-	}
-	p.config.Store(&c)
+	spss[len(spss)-1] = nil
+	spss = spss[:len(spss)-1]
+
+	p.spanProcessors.Store(spss)
 }
 
-// WithSyncer options appends the syncer to the existing list of Syncers.
-// This option can be used multiple times.
-// The Syncers are wrapped into SimpleSpanProcessors and registered
-// with the provider.
-func WithSyncer(syncer export.SpanSyncer) ProviderOption {
-	return func(opts *ProviderOptions) {
-		opts.syncers = append(opts.syncers, syncer)
+// ForceFlush immediately exports all spans that have not yet been exported for
+// all the registered span processors.
+func (p *TracerProvider) ForceFlush(ctx context.Context) error {
+	spss, ok := p.spanProcessors.Load().(spanProcessorStates)
+	if !ok {
+		return fmt.Errorf("failed to load span processors")
+	}
+	if len(spss) == 0 {
+		return nil
+	}
+
+	for _, sps := range spss {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if err := sps.sp.ForceFlush(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Shutdown shuts down the span processors in the order they were registered.
+func (p *TracerProvider) Shutdown(ctx context.Context) error {
+	spss, ok := p.spanProcessors.Load().(spanProcessorStates)
+	if !ok {
+		return fmt.Errorf("failed to load span processors")
+	}
+	if len(spss) == 0 {
+		return nil
+	}
+
+	for _, sps := range spss {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		var err error
+		sps.state.Do(func() {
+			err = sps.sp.Shutdown(ctx)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WithSyncer registers the exporter with the TracerProvider using a
+// SimpleSpanProcessor.
+func WithSyncer(e export.SpanExporter) TracerProviderOption {
+	return WithSpanProcessor(NewSimpleSpanProcessor(e))
+}
+
+// WithBatcher registers the exporter with the TracerProvider using a
+// BatchSpanProcessor configured with the passed opts.
+func WithBatcher(e export.SpanExporter, opts ...BatchSpanProcessorOption) TracerProviderOption {
+	return WithSpanProcessor(NewBatchSpanProcessor(e, opts...))
+}
+
+// WithSpanProcessor registers the SpanProcessor with a TracerProvider.
+func WithSpanProcessor(sp SpanProcessor) TracerProviderOption {
+	return func(opts *TracerProviderConfig) {
+		opts.processors = append(opts.processors, sp)
 	}
 }
 
-// WithBatcher options appends the batcher to the existing list of Batchers.
-// This option can be used multiple times.
-// The Batchers are wrapped into BatchedSpanProcessors and registered
-// with the provider.
-func WithBatcher(b export.SpanBatcher, bopts ...BatchSpanProcessorOption) ProviderOption {
-	return func(opts *ProviderOptions) {
-		opts.batchers = append(opts.batchers, batcher{b, bopts})
+// WithResource returns a TracerProviderOption that will configure the
+// Resource r as a TracerProvider's Resource. The configured Resource is
+// referenced by all the Tracers the TracerProvider creates. It represents the
+// entity producing telemetry.
+//
+// If this option is not used, the TracerProvider will use the
+// resource.Default() Resource by default.
+func WithResource(r *resource.Resource) TracerProviderOption {
+	return func(opts *TracerProviderConfig) {
+		if r != nil {
+			opts.resource = r
+		}
 	}
 }
 
-// WithConfig option sets the configuration to provider.
-func WithConfig(config Config) ProviderOption {
-	return func(opts *ProviderOptions) {
-		opts.config = config
+// WithIDGenerator returns a TracerProviderOption that will configure the
+// IDGenerator g as a TracerProvider's IDGenerator. The configured IDGenerator
+// is used by the Tracers the TracerProvider creates to generate new Span and
+// Trace IDs.
+//
+// If this option is not used, the TracerProvider will use a random number
+// IDGenerator by default.
+func WithIDGenerator(g IDGenerator) TracerProviderOption {
+	return func(opts *TracerProviderConfig) {
+		if g != nil {
+			opts.idGenerator = g
+		}
 	}
 }
 
-// WithResource option attaches a resource to the provider.
-// The resource is added to the span when it is started.
-func WithResource(r *resource.Resource) ProviderOption {
-	return func(opts *ProviderOptions) {
-		opts.config.Resource = r
+// WithSampler returns a TracerProviderOption that will configure the Sampler
+// s as a TracerProvider's Sampler. The configured Sampler is used by the
+// Tracers the TracerProvider creates to make their sampling decisions for the
+// Spans they create.
+//
+// If this option is not used, the TracerProvider will use a
+// ParentBased(AlwaysSample) Sampler by default.
+func WithSampler(s Sampler) TracerProviderOption {
+	return func(opts *TracerProviderConfig) {
+		if s != nil {
+			opts.sampler = s
+		}
+	}
+}
+
+// WithSpanLimits returns a TracerProviderOption that will configure the
+// SpanLimits sl as a TracerProvider's SpanLimits. The configured SpanLimits
+// are used used by the Tracers the TracerProvider and the Spans they create
+// to limit tracing resources used.
+//
+// If this option is not used, the TracerProvider will use the default
+// SpanLimits.
+func WithSpanLimits(sl SpanLimits) TracerProviderOption {
+	return func(opts *TracerProviderConfig) {
+		opts.spanLimits = sl
+	}
+}
+
+// ensureValidTracerProviderConfig ensures that given TracerProviderConfig is valid.
+func ensureValidTracerProviderConfig(cfg *TracerProviderConfig) {
+	if cfg.sampler == nil {
+		cfg.sampler = ParentBased(AlwaysSample())
+	}
+	if cfg.idGenerator == nil {
+		cfg.idGenerator = defaultIDGenerator()
+	}
+	cfg.spanLimits.ensureDefault()
+	if cfg.resource == nil {
+		cfg.resource = resource.Default()
 	}
 }
